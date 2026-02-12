@@ -380,5 +380,276 @@ this.bot.on('text', async (ctx) => {
         // Уведомление получателю (заглушка)
         delete ctx.session.awaitingTwinInvite;
         return;
+    }// ========== АДМИН-ПАНЕЛЬ С ГРАФИКАМИ ==========
+// Только для админа (ID: 438850682)
+
+private async generateActivityChart(days: number = 7): Promise<string> {
+    const data = [];
+    const now = Date.now();
+    
+    for (let i = days - 1; i >= 0; i--) {
+        const day = now - i * 24 * 60 * 60 * 1000;
+        const nextDay = day + 24 * 60 * 60 * 1000;
+        
+        const count = await this.db.players.countDocuments({
+            lastAction: { $gte: day, $lt: nextDay }
+        });
+        data.push(count);
     }
+    
+    const max = Math.max(...data, 1);
+    let chart = '📊 **АКТИВНОСТЬ (7 ДНЕЙ)**\n```\n';
+    
+    const daysNames = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
+    const today = new Date().getDay();
+    
+    for (let i = 0; i < days; i++) {
+        const dayIndex = (today - days + i + 7) % 7;
+        const barLength = Math.round((data[i] / max) * 20);
+        const bar = '█'.repeat(barLength) + '░'.repeat(20 - barLength);
+        chart += `${daysNames[dayIndex]} ${bar} ${data[i]}\n`;
+    }
+    
+    chart += '```\n🟢 Активность игроков по дням';
+    return chart;
+}
+
+private async generateSoulChart(): Promise<string> {
+    const total = await this.db.players.countDocuments();
+    const alive = await this.db.players.countDocuments({ 'soul.current': { $gt: 0 } });
+    const dead = await this.db.players.countDocuments({ 'soul.current': 0 });
+    const critical = await this.db.players.countDocuments({ 'soul.current': { $lt: 30, $gt: 0 } });
+    
+    const alivePercent = Math.round((alive / total) * 100) || 0;
+    const deadPercent = Math.round((dead / total) * 100) || 0;
+    const criticalPercent = Math.round((critical / total) * 100) || 0;
+    
+    let chart = '💀 **СОСТОЯНИЕ ДУШ**\n```\n';
+    chart += `🟢 Живы:  ${'█'.repeat(Math.round(alivePercent / 5))}${'░'.repeat(20 - Math.round(alivePercent / 5))} ${alive} (${alivePercent}%)\n`;
+    chart += `⚠️ Крит:  ${'█'.repeat(Math.round(criticalPercent / 5))}${'░'.repeat(20 - Math.round(criticalPercent / 5))} ${critical} (${criticalPercent}%)\n`;
+    chart += `⚰️ Мертвы: ${'█'.repeat(Math.round(deadPercent / 5))}${'░'.repeat(20 - Math.round(deadPercent / 5))} ${dead} (${deadPercent}%)\n`;
+    chart += '```\n🟢 Живы | ⚠️ Критически | ⚰️ Мертвы';
+    return chart;
+}
+
+private async generateEconomyChart(): Promise<string> {
+    const players = await this.db.players.find().sort({ stars: -1 }).limit(5).toArray();
+    
+    let chart = '💰 **ТОП БАЛАНСОВ**\n```\n';
+    players.forEach((p, i) => {
+        const stars = p.stars || 0;
+        const barLength = Math.min(20, Math.round(Math.log10(stars + 1) * 5));
+        const bar = '█'.repeat(barLength) + '░'.repeat(20 - barLength);
+        chart += `${i + 1}. @${p.username || 'unknown'}\n   ${bar} ${Formatter.formatNumber(stars)}⭐\n`;
+    });
+    chart += '```\n🏆 Топ-5 богачей';
+    return chart;
+}
+
+// ========== DASHBOARD ==========
+this.bot.command('dashboard', async (ctx) => {
+    // Только для админа
+    if (ctx.from.id !== 438850682) {
+        return await ctx.reply('❌ Только для администратора');
+    }
+    
+    try {
+        const now = Date.now();
+        const hourAgo = now - 60 * 60 * 1000;
+        const today = new Date().setHours(0, 0, 0, 0);
+        
+        const [total, online, activityChart, soulChart, economyChart] = await Promise.all([
+            this.db.players.countDocuments(),
+            this.db.players.countDocuments({ lastAction: { $gt: hourAgo } }),
+            this.generateActivityChart(),
+            this.generateSoulChart(),
+            this.generateEconomyChart()
+        ]);
+        
+        const onlinePercent = Math.round((online / total) * 100) || 0;
+        const onlineBar = '🟢'.repeat(Math.round(onlinePercent / 10)) + '⚫'.repeat(10 - Math.round(onlinePercent / 10));
+        
+        const message = `
+📊 **SENTINEL: ECHO — DASHBOARD**
+━━━━━━━━━━━━━━━━━━━━━
+
+👥 **ОНЛАЙН**
+┌ 👤 Всего: ${total}
+├ 🟢 Сейчас: ${online} (${onlinePercent}%)
+└ ${onlineBar}
+
+${activityChart}
+
+${soulChart}
+
+${economyChart}
+
+━━━━━━━━━━━━━━━━━━━━━
+📋 /stats — Детальная статистика
+💀 /topsoul — Топ по душе
+⚔️ /pvptop — Топ PvP
+        `;
+        
+        await ctx.replyWithMarkdown(message);
+        
+    } catch (error) {
+        console.error('Dashboard error:', error);
+        await ctx.reply('❌ Ошибка загрузки дашборда');
+    }
+});
+
+// ========== МИНИ-ИГРА: ЭХО ПАМЯТИ ==========
+// Мини-игра про связь с Оригиналом
+
+this.bot.command('memory', async (ctx) => {
+    try {
+        const player = await this.db.players.findOne({ telegramId: ctx.from.id });
+        const twinFeeling = await this.twin.getTwinFeeling(ctx.from.id);
+        
+        if (!player?.twin) {
+            return await ctx.reply('🔮 У тебя ещё нет Тени... Придёт время.');
+        }
+        
+        const strength = twinFeeling?.strength || 0.1;
+        const maxRounds = 3;
+        let round = 1;
+        let score = 0;
+        
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🎮 Начать игру', 'memory_start')]
+        ]);
+        
+        await ctx.replyWithMarkdown(
+            `🧠 **ЭХО ПАМЯТИ**\n\n` +
+            `Ты чувствуешь своего Оригинала. Его воспоминания становятся твоими.\n\n` +
+            `**Сила связи:** ${Math.round(strength * 100)}%\n` +
+            `**Сложность:** ${strength > 0.7 ? 'Легко' : strength > 0.4 ? 'Средне' : 'Тяжело'}\n\n` +
+            `Попробуй угадать воспоминания Оригинала. Чем сильнее связь — тем легче.`,
+            keyboard
+        );
+        
+    } catch (error) {
+        console.error('Memory game error:', error);
+        await ctx.reply('❌ Ошибка');
+    }
+});
+
+this.bot.action('memory_start', async (ctx) => {
+    await ctx.answerCbQuery();
+    
+    const player = await this.db.players.findOne({ telegramId: ctx.from.id });
+    const twinFeeling = await this.twin.getTwinFeeling(ctx.from.id);
+    const strength = twinFeeling?.strength || 0.1;
+    
+    // Генерируем воспоминание
+    const memories = [
+        { emoji: '🌲', text: 'Лес', hint: 'Там пахло соснами' },
+        { emoji: '🌊', text: 'Море', hint: 'Солёный ветер' },
+        { emoji: '🏔️', text: 'Горы', hint: 'Холод и тишина' },
+        { emoji: '🌃', text: 'Город', hint: 'Огни и шум' },
+        { emoji: '📚', text: 'Библиотека', hint: 'Запах старых книг' },
+        { emoji: '🎮', text: 'Аркада', hint: 'Пиксели и джойстики' },
+        { emoji: '☕', text: 'Кафе', hint: 'Горький кофе' },
+        { emoji: '🎸', text: 'Концерт', hint: 'Гитара и толпа' }
+    ];
+    
+    const memory = memories[Math.floor(Math.random() * memories.length)];
+    ctx.session = ctx.session || {};
+    ctx.session.memoryGame = {
+        memory,
+        round: 1,
+        score: 0,
+        maxRounds: 3 + Math.floor(strength * 2)
+    };
+    
+    const hintChance = Math.min(0.8, strength);
+    const showHint = Math.random() < hintChance;
+    
+    let message = `🎮 **РАУНД ${ctx.session.memoryGame.round}**\n\n`;
+    message += `Ты чувствуешь воспоминание...\n\n`;
+    message += `**${memory.emoji}**\n\n`;
+    
+    if (showHint) {
+        message += `_«${memory.hint}»_\n\n`;
+    }
+    
+    message += `Что это за место?`;
+    
+    const buttons = memories.map(m => 
+        Markup.button.callback(m.emoji, `memory_answer_${m.text}`)
+    );
+    
+    // Распределяем кнопки по рядам (по 2 в ряд)
+    const keyboard = Markup.inlineKeyboard([
+        buttons.slice(0, 2),
+        buttons.slice(2, 4),
+        buttons.slice(4, 6),
+        buttons.slice(6, 8)
+    ]);
+    
+    await ctx.editMessageText(message, {
+        parse_mode: 'Markdown',
+        ...keyboard
+    });
+});
+
+this.bot.action(/memory_answer_(.+)/, async (ctx) => {
+    await ctx.answerCbQuery();
+    
+    const answer = ctx.match[1];
+    const game = ctx.session?.memoryGame;
+    
+    if (!game) {
+        return await ctx.reply('❌ Игра не найдена. Начни заново /memory');
+    }
+    
+    const isCorrect = answer === game.memory.text;
+    
+    if (isCorrect) {
+        game.score += 10;
+        await ctx.replyWithMarkdown(`✅ Верно! +10 баллов`);
+    } else {
+        await ctx.replyWithMarkdown(`❌ Нет, это было **${game.memory.text}**`);
+    }
+    
+    game.round++;
+    
+    if (game.round > game.maxRounds) {
+        // Игра окончена
+        const bondIncrease = game.score / 500; // +0.02 за 10 очков
+        await this.db.players.updateOne(
+            { telegramId: ctx.from.id },
+            { $inc: { 'twin.bondStrength': bondIncrease } }
+        );
+        
+        const message = `
+🏆 **ИГРА ОКОНЧЕНА!**
+
+📊 **Счёт:** ${game.score}/${game.maxRounds * 10}
+🔮 **Сила связи:** +${Math.round(bondIncrease * 100)}%
+
+_Ты стал чуть ближе к своему Оригиналу..._
+        `;
+        
+        await ctx.replyWithMarkdown(message);
+        delete ctx.session.memoryGame;
+    } else {
+        // Следующий раунд
+        const fakeCtx = { ...ctx, update: { callback_query: { data: 'memory_start' } } } as any;
+        await this.bot.handleUpdate(fakeCtx.update);
+    }
+});
+
+// ========== ЕЖЕДНЕВНЫЙ ОТЧЕТ ==========
+// Добавь в main.ts:
+/*
+setInterval(async () => {
+    const now = new Date();
+    if (now.getHours() === 23 && now.getMinutes() === 59) {
+        const bot = getBot();
+        const stats = await generateDailyReport();
+        await bot.telegram.sendMessage(438850682, stats, { parse_mode: 'Markdown' });
+    }
+}, 60000);
+*/
 });
