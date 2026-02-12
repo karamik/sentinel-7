@@ -508,3 +508,226 @@ export class Visuals {
     return emojis[rarity as keyof typeof emojis] || '⚪';
   }
 }
+// ========== visuals.ts - ДОПОЛНЕНИЕ: ЛИМИТЫ И ГАЛЕРЕЯ ==========
+
+// ========== 1. СИСТЕМА ЛИМИТОВ ==========
+export class VisualsSystem {
+    // ... существующий код ...
+
+    async checkGenerationLimit(telegramId: number): Promise<{
+        allowed: boolean;
+        remaining: number;
+        total: number;
+        resetTime: number;
+    }> {
+        const player = await this.db.players.findOne({ telegramId });
+        if (!player) return { allowed: false, remaining: 0, total: 0, resetTime: 0 };
+
+        const now = Date.now();
+        const today = new Date().setHours(0, 0, 0, 0);
+        
+        // Настройки лимитов (можно вынести в CONFIG)
+        const DAILY_LIMIT = {
+            FREE: 3,        // 3 генерации в день для обычных игроков
+            VIP: 10,        // 10 для VIP
+            LEGENDARY: 1,   // +1 за каждую легендарку
+            MYTHIC: 2       // +2 за каждый мифик
+        };
+
+        // Считаем использованные генерации за сегодня
+        const used = player.stats?.generatedImages?.filter(
+            (g: any) => g.timestamp > today
+        ).length || 0;
+
+        // Рассчитываем лимит
+        let limit = DAILY_LIMIT.FREE;
+        
+        // VIP бонус
+        if (player.vip?.until > now) {
+            limit = DAILY_LIMIT.VIP;
+        }
+        
+        // Бонус за легендарки
+        const legendaries = await this.db.artifacts.countDocuments({
+            telegramId,
+            rarity: 'LEGENDARY'
+        });
+        limit += legendaries * DAILY_LIMIT.LEGENDARY;
+        
+        // Бонус за мифики
+        const mythics = await this.db.artifacts.countDocuments({
+            telegramId,
+            rarity: 'MYTHIC'
+        });
+        limit += mythics * DAILY_LIMIT.MYTHIC;
+
+        // Не больше 50 в день
+        limit = Math.min(limit, 50);
+
+        const resetTime = today + 24 * 60 * 60 * 1000;
+        
+        return {
+            allowed: used < limit,
+            remaining: Math.max(0, limit - used),
+            total: limit,
+            resetTime
+        };
+    }
+
+    // ========== 2. ГАЛЕРЕЯ АРТЕФАКТОВ ==========
+    async showGallery(telegramId: number, page: number = 0): Promise<{
+        message: string;
+        keyboard: any;
+        total: number;
+    }> {
+        const ITEMS_PER_PAGE = 5;
+        
+        // Получаем артефакты с изображениями
+        const artifacts = await this.db.artifacts
+            .find({ 
+                telegramId,
+                imageUrl: { $exists: true, $ne: null }
+            })
+            .sort({ foundAt: -1 })
+            .skip(page * ITEMS_PER_PAGE)
+            .limit(ITEMS_PER_PAGE)
+            .toArray();
+
+        const total = await this.db.artifacts.countDocuments({
+            telegramId,
+            imageUrl: { $exists: true, $ne: null }
+        });
+
+        if (artifacts.length === 0) {
+            return {
+                message: '🖼️ **У тебя ещё нет артефактов с изображениями**\n\nИспользуй `/imagine` чтобы создать AI-образ для своих легендарок и мификов!',
+                keyboard: Markup.inlineKeyboard([
+                    [Markup.button.callback('🎨 Создать изображение', 'imagine_menu')]
+                ]),
+                total: 0
+            };
+        }
+
+        let message = `🖼️ **ГАЛЕРЕЯ АРТЕФАКТОВ**\n`;
+        message += `━━━━━━━━━━━━━━━━━━━━━\n`;
+        message += `📦 Всего: ${total} изображений\n`;
+        message += `📃 Страница ${page + 1}/${Math.ceil(total / ITEMS_PER_PAGE)}\n\n`;
+
+        const buttons = [];
+        
+        for (let i = 0; i < artifacts.length; i++) {
+            const a = artifacts[i];
+            const emoji = {
+                'COMMON': '🟢',
+                'RARE': '🔵',
+                'EPIC': '🟣',
+                'LEGENDARY': '🟠',
+                'MYTHIC': '🔴'
+            }[a.rarity] || '⚪';
+            
+            message += `${emoji} **${a.loreName || a.name}**\n`;
+            message += `└ 📊 ${a.rarity} | 💰 ${a.value}⭐\n`;
+            
+            // Кнопка для просмотра
+            buttons.push([
+                Markup.button.callback(
+                    `👁️ ${a.name.substring(0, 15)}...`,
+                    `view_${a.id}`
+                )
+            ]);
+        }
+
+        // Навигация
+        const navButtons = [];
+        if (page > 0) {
+            navButtons.push(Markup.button.callback('◀️ Назад', `gallery_page_${page - 1}`));
+        }
+        if ((page + 1) * ITEMS_PER_PAGE < total) {
+            navButtons.push(Markup.button.callback('Вперёд ▶️', `gallery_page_${page + 1}`));
+        }
+        
+        if (navButtons.length > 0) {
+            buttons.push(navButtons);
+        }
+
+        buttons.push([Markup.button.callback('🎨 Новое изображение', 'imagine_menu')]);
+        buttons.push([Markup.button.callback('🏠 Главное меню', 'menu_game')]);
+
+        return {
+            message,
+            keyboard: Markup.inlineKeyboard(buttons),
+            total
+        };
+    }
+
+    // ========== 3. СТАТИСТИКА ГЕНЕРАЦИЙ ==========
+    async getGenerationStats(telegramId: number): Promise<string> {
+        const player = await this.db.players.findOne({ telegramId });
+        if (!player) return '❌ Игрок не найден';
+
+        const now = Date.now();
+        const today = new Date().setHours(0, 0, 0, 0);
+        const weekAgo = now - 7 * 24 * 60 * 60 * 1000;
+
+        const total = player.stats?.generatedImages?.length || 0;
+        const todayCount = player.stats?.generatedImages?.filter(
+            (g: any) => g.timestamp > today
+        ).length || 0;
+        const weekCount = player.stats?.generatedImages?.filter(
+            (g: any) => g.timestamp > weekAgo
+        ).length || 0;
+
+        const limit = await this.checkGenerationLimit(telegramId);
+        const resetDate = new Date(limit.resetTime).toLocaleTimeString('ru-RU', {
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+
+        // Группировка по редкости
+        const artifacts = await this.db.artifacts
+            .find({ 
+                telegramId,
+                imageUrl: { $exists: true }
+            })
+            .toArray();
+
+        const byRarity = {
+            'COMMON': 0, 'RARE': 0, 'EPIC': 0,
+            'LEGENDARY': 0, 'MYTHIC': 0
+        };
+
+        artifacts.forEach(a => {
+            byRarity[a.rarity] = (byRarity[a.rarity] || 0) + 1;
+        });
+
+        let message = `
+🎨 **СТАТИСТИКА AI-ГЕНЕРАЦИИ**
+━━━━━━━━━━━━━━━━━━━━━
+
+📊 **Использовано:**
+┌ 🎨 Всего генераций: ${total}
+├ 📅 Сегодня: ${todayCount}/${limit.total}
+├ 📆 За неделю: ${weekCount}
+└ ⏳ Сброс лимита: ${resetDate}
+
+🖼️ **Коллекция:**
+┌ 🟢 Обычные: ${byRarity.COMMON}
+├ 🔵 Редкие: ${byRarity.RARE}
+├ 🟣 Эпические: ${byRarity.EPIC}
+├ 🟠 Легендарные: ${byRarity.LEGENDARY}
+└ 🔴 Мифические: ${byRarity.MYTHIC}
+
+💎 **Бонусы:**
+• VIP: +7 генераций в день
+• Каждая легендарка: +1 генерация
+• Каждый мифик: +2 генерации
+        `;
+
+        return message;
+    }
+}
+
+// ========== 4. ЭКСПОРТ ОБНОВЛЁННОГО КЛАССА ==========
+export function setupVisuals(db: Database): VisualsSystem {
+    return new VisualsSystem(db);
+}
