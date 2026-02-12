@@ -8,6 +8,7 @@ import {
 } from './config.ts';
 import { Random, Logger } from './utils.ts';
 import { TwinSystem } from './twins.ts';
+import { SoulSystem } from './soul.ts';
 import { ArtifactStories, WELCOME_LORE } from './lore.ts';
 
 export class SentinelGame {
@@ -68,6 +69,10 @@ export class SentinelGame {
             };
             
             await this.db.players.insertOne(newPlayer);
+            
+            // Инициализация души
+            const soulSystem = new SoulSystem(this.db);
+            await soulSystem.initSoul(telegramId);
             
             // Добавляем систему близнецов
             const twinSystem = new TwinSystem(this.db);
@@ -172,7 +177,10 @@ export class SentinelGame {
                 
                 message = '✅ **ВЗЛОМ УСПЕШЕН!**';
             } else {
-                // Неудача
+                // Неудача - потеря души
+                const soulSystem = new SoulSystem(this.db);
+                await soulSystem.loseSoul(telegramId, CONFIG.SOUL.HACK_FAIL_LOSS, 'hack_failed');
+                
                 await this.db.players.updateOne(
                     { telegramId },
                     {
@@ -189,7 +197,7 @@ export class SentinelGame {
                     }
                 );
                 
-                message = '❌ **ВЗЛОМ НЕУДАЧЕН!** Система защищена.';
+                message = '❌ **ВЗЛОМ НЕУДАЧЕН!** Система защищена.\n💀 Душа -2%';
                 experience = 5;
             }
             
@@ -333,6 +341,10 @@ export class SentinelGame {
                 ? Math.round(((player.stats?.successfulHacks || 0) / totalHacks) * 100) 
                 : 0;
             
+            // Получаем состояние души
+            const soulSystem = new SoulSystem(this.db);
+            const soul = await soulSystem.getSoul(telegramId);
+            
             // Получаем ощущение связи с близнецом
             const twinFeeling = await new TwinSystem(this.db).getTwinFeeling(telegramId);
             
@@ -349,6 +361,8 @@ export class SentinelGame {
                 successRate,
                 guildId: player.guildId,
                 pvpRating: player.pvp?.rating || 0,
+                soulPercentage: soul?.percentage || 100,
+                soulState: soul?.isDead ? '💀' : soul?.isCritical ? '🔥' : '💚',
                 twinFeeling: twinFeeling?.feeling || null,
                 twinBond: twinFeeling?.strength || 0
             };
@@ -357,5 +371,257 @@ export class SentinelGame {
             Logger.error('Get profile error', error);
             return null;
         }
+    }
+
+    // ========== МЕТОДЫ БИТВ ==========
+
+    // PvP Битва Воспоминаний
+    async startMemoryBattle(player1Id: number, player2Id: number) {
+        try {
+            const player1 = await this.db.players.findOne({ telegramId: player1Id });
+            const player2 = await this.db.players.findOne({ telegramId: player2Id });
+
+            if (!player1 || !player2) {
+                return { success: false, message: '❌ Игрок не найден' };
+            }
+
+            // Проверка энергии
+            if (player1.energy < CONFIG.PVP.ENERGY_COST || player2.energy < CONFIG.PVP.ENERGY_COST) {
+                return { success: false, message: '❌ Недостаточно энергии' };
+            }
+
+            // Создаем битву
+            const battleId = this.db.generateId();
+            const battle = {
+                id: battleId,
+                player1: {
+                    id: player1Id,
+                    username: player1.username,
+                    soul: player1.soul?.current || 100,
+                    hp: 100,
+                    memory: await this.getRandomArtifact(player1Id)
+                },
+                player2: {
+                    id: player2Id,
+                    username: player2.username,
+                    soul: player2.soul?.current || 100,
+                    hp: 100,
+                    memory: await this.getRandomArtifact(player2Id)
+                },
+                currentTurn: player1Id,
+                round: 1,
+                status: 'active',
+                createdAt: Date.now(),
+                lastAction: Date.now()
+            };
+
+            // Сохраняем битву
+            await this.db.battles.insertOne(battle);
+
+            // Снимаем энергию
+            await this.db.players.updateMany(
+                { telegramId: { $in: [player1Id, player2Id] } },
+                { $inc: { energy: -CONFIG.PVP.ENERGY_COST } }
+            );
+
+            return {
+                success: true,
+                battleId,
+                message: `⚔️ **БИТВА ВОСПОМИНАНИЙ НАЧАЛАСЬ!**\n\n` +
+                    `${player1.username} VS ${player2.username}\n\n` +
+                    `🎮 Ход игрока: ${battle.currentTurn === player1Id ? player1.username : player2.username}\n\n` +
+                    `📖 **Воспоминание:**\n` +
+                    `"${battle[battle.currentTurn === player1Id ? 'player1' : 'player2'].memory.name}"\n` +
+                    `${battle[battle.currentTurn === player1Id ? 'player1' : 'player2'].memory.story || 'Древнее воспоминание...'}`
+            };
+        } catch (error) {
+            Logger.error('Battle error', error);
+            return { success: false, message: '❌ Ошибка создания битвы' };
+        }
+    }
+
+    // Ход в битве
+    async memoryStrike(battleId: string, attackerId: number, defenderId: number) {
+        try {
+            const battle = await this.db.battles.findOne({ id: battleId });
+            if (!battle || battle.status !== 'active') {
+                return { success: false, message: '❌ Битва не найдена или завершена' };
+            }
+
+            if (battle.currentTurn !== attackerId) {
+                return { success: false, message: '⏳ Сейчас не твой ход' };
+            }
+
+            const attacker = battle.player1.id === attackerId ? battle.player1 : battle.player2;
+            const defender = battle.player1.id === defenderId ? battle.player1 : battle.player2;
+
+            const buttons = [
+                [{ text: '💔 Принять боль (-15 HP)', callback_data: `battle_accept_${battleId}` }],
+                [{ text: '🧹 Стереть воспоминание (-1 артефакт)', callback_data: `battle_erase_${battleId}` }]
+            ];
+
+            return {
+                success: true,
+                message: `🔮 **Ход игрока ${attacker.username}**\n\n` +
+                    `📖 **Воспоминание:**\n"${attacker.memory.name}"\n\n` +
+                    `${attacker.username} атакует ${defender.username}!\n\n` +
+                    `**Выбери свою судьбу:**`,
+                buttons
+            };
+        } catch (error) {
+            Logger.error('Memory strike error', error);
+            return { success: false, message: '❌ Ошибка хода' };
+        }
+    }
+
+    // Принять урон
+    async acceptPain(battleId: string, defenderId: number) {
+        const battle = await this.db.battles.findOne({ id: battleId });
+        if (!battle) return { success: false, message: '❌ Битва не найдена' };
+
+        const defender = battle.player1.id === defenderId ? battle.player1 : battle.player2;
+        const attacker = battle.player1.id === defenderId ? battle.player2 : battle.player1;
+
+        const damage = CONFIG.BATTLE.BASE_DAMAGE + Math.floor(Math.random() * 20);
+        defender.hp -= damage;
+
+        let battleEnded = false;
+        let winner = null;
+
+        if (defender.hp <= 0) {
+            battleEnded = true;
+            winner = attacker.id;
+            defender.hp = 0;
+        }
+
+        await this.db.battles.updateOne(
+            { id: battleId },
+            {
+                $set: {
+                    currentTurn: battleEnded ? null : defender.id,
+                    round: battle.round + 1,
+                    lastAction: Date.now(),
+                    status: battleEnded ? 'finished' : 'active',
+                    winner: winner,
+                    [`${defender.id === battle.player1.id ? 'player1' : 'player2'}.hp`]: defender.hp
+                }
+            }
+        );
+
+        if (battleEnded) {
+            // Награда победителю
+            await this.db.players.updateOne(
+                { telegramId: winner },
+                {
+                    $inc: {
+                        stars: CONFIG.PVP.BASE_REWARD,
+                        'stats.pvpWins': 1,
+                        'pvp.rating': CONFIG.PVP.RATING_WIN
+                    }
+                }
+            );
+
+            // Наказание проигравшему
+            const soulSystem = new SoulSystem(this.db);
+            await soulSystem.loseSoul(
+                defender.id,
+                CONFIG.SOUL.PVP_LOSS,
+                'pvp_defeat'
+            );
+
+            return {
+                success: true,
+                battleEnded: true,
+                winner: attacker.username,
+                message: `💥 **УДАР ПРИНЯТ!**\n\n` +
+                    `${defender.username} получает ${damage} урона\n` +
+                    `HP: ${defender.hp + damage} → ${defender.hp}\n\n` +
+                    `🏆 **ПОБЕДИТЕЛЬ: ${attacker.username}**\n` +
+                    `Награда: ${CONFIG.PVP.BASE_REWARD}⭐, +${CONFIG.PVP.RATING_WIN} рейтинга\n` +
+                    `💀 Проигравший теряет ${CONFIG.SOUL.PVP_LOSS}% души`
+            };
+        }
+
+        return {
+            success: true,
+            battleEnded: false,
+            message: `💔 **${defender.username} принял боль!**\n\n` +
+                `Урон: ${damage}\n` +
+                `Осталось HP: ${defender.hp}\n\n` +
+                `🎮 Следующий ход: ${defender.username}`
+        };
+    }
+
+    // Стереть воспоминание
+    async eraseMemory(battleId: string, defenderId: number) {
+        const battle = await this.db.battles.findOne({ id: battleId });
+        if (!battle) return { success: false, message: '❌ Битва не найдена' };
+
+        const defender = battle.player1.id === defenderId ? battle.player1 : battle.player2;
+        const attacker = battle.player1.id === defenderId ? battle.player2 : battle.player1;
+
+        const player = await this.db.players.findOne({ telegramId: defenderId });
+        if (!player || !player.inventory || player.inventory.length === 0) {
+            return this.acceptPain(battleId, defenderId);
+        }
+
+        const randomIndex = Math.floor(Math.random() * player.inventory.length);
+        const artifactId = player.inventory[randomIndex];
+
+        await this.db.players.updateOne(
+            { telegramId: defenderId },
+            { $pull: { inventory: artifactId } }
+        );
+
+        await this.db.artifacts.deleteOne({ id: artifactId });
+
+        const damage = Math.floor(CONFIG.BATTLE.BASE_DAMAGE * 0.5);
+        defender.hp -= damage;
+
+        await this.db.battles.updateOne(
+            { id: battleId },
+            {
+                $set: {
+                    currentTurn: defender.id,
+                    round: battle.round + 1,
+                    lastAction: Date.now(),
+                    [`${defender.id === battle.player1.id ? 'player1' : 'player2'}.hp`]: defender.hp
+                }
+            }
+        );
+
+        return {
+            success: true,
+            message: `🧹 **ВОСПОМИНАНИЕ СТЕРТО!**\n\n` +
+                `${defender.username} пожертвовал артефактом, чтобы уменьшить боль.\n` +
+                `Урон: ${damage}\n` +
+                `HP: ${defender.hp + damage} → ${defender.hp}\n\n` +
+                `🎮 Следующий ход: ${defender.username}`
+        };
+    }
+
+    // Получить случайный артефакт игрока
+    private async getRandomArtifact(telegramId: number) {
+        const player = await this.db.players.findOne({ telegramId });
+        if (!player?.inventory || player.inventory.length === 0) {
+            return {
+                id: 'default',
+                name: 'Воспоминание о пустоте',
+                story: 'Ты еще не создал ни одного воспоминания...',
+                value: 0
+            };
+        }
+
+        const randomId = player.inventory[
+            Math.floor(Math.random() * player.inventory.length)
+        ];
+        
+        const artifact = await this.db.artifacts.findOne({ id: randomId });
+        return artifact || {
+            id: 'default',
+            name: 'Утраченное воспоминание',
+            story: 'Оно было стерто временем...',
+            value: 0
+        };
     }
 }
