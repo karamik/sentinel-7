@@ -1,3 +1,61 @@
+
+# ========== SENTINEL: ECHO — .gitignore ==========
+
+# 🔐 Личные данные и секреты
 .env
-.DS_Store
+.env.local
+.env.production
+.env.development
+
+# 🗄️ Базы данных
+*.db
+*.sqlite
+mongodb-data/
+
+# 📦 Зависимости
+node_modules/
+deno_modules/
+deno.lock
+package-lock.json
+yarn.lock
+
+# 🚀 Сборка и кэш
+dist/
+build/
+.cache/
+.temp/
+*.tsbuildinfo
+
+# 📝 Логи
+logs/
 *.log
+npm-debug.log*
+deno-error.log
+
+# 🖼️ Сгенерированные изображения
+artifacts/images/
+!artifacts/placeholder.png
+
+# 🧪 Тесты
+coverage/
+.nyc_output/
+*.test.ts
+*.spec.ts
+
+# 💻 IDE и редакторы
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# 📦 Временные файлы
+tmp/
+temp/
+*.tmp
+*.temp
+
+# 🔧 Конфиги приложения (но НЕ .env.example!)
+# .env.example хранится в репозитории!
